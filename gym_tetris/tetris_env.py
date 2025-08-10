@@ -1,200 +1,234 @@
+# gym_tetris/tetris_env.py
 import numpy as np
 import gymnasium as gym
 from gymnasium import spaces
 from typing import Optional, Dict, Any, Tuple
+from engines.nuno_faria import tetris as T
 
 
-"""
-Tetris Gymnasium Environment Wrapper (for nuno-faria/tetris-ai engine)
-
-This wrapper exposes a Gymnasium-compatible API around the engine so you can
-use Stable-Baselines3 PPO out of the box.
-
-It is intentionally defensive because forks of the engine differ a bit:
-- Some constructors accept (width, height); others do not.
-- Some expose get_possible_states()/apply_action(); others do not.
-
-If a method is missing, we fall back gracefully and end the episode rather
-than crashing, so you can iterate quickly.
-"""
-
-
-# -----------------------------
-# Engine Adapter
-# -----------------------------
-class _EngineAdapter:
-    """
-    Thin adapter around engines.nuno_faria.tetris.Tetris to normalize calls.
-    """
-
-    def __init__(self, width: int = 10, height: int = 20):
-        try:
-            from engines.nuno_faria.tetris import Tetris  # type: ignore
-        except Exception as e:
-            raise ImportError(
-                "Could not import engines.nuno_faria.tetris.Tetris. "
-                "Run `python prepare_engine.py` first (and ensure dependencies like opencv-python-headless are installed)."
-            ) from e
-
-        self._T = Tetris
-
-        # Try engines that accept (width, height). If not, fall back to no-arg.
-        try:
-            self.game = Tetris(width=width, height=height)
-        except TypeError:
-            self.game = Tetris()
-
-        # Cache dimensions if the engine exposes them; otherwise use defaults.
-        self.width = getattr(self.game, "width", width)
-        self.height = getattr(self.game, "height", height)
-
-    def reset(self):
-        """Recreate a fresh engine instance each episode."""
-        try:
-            self.game = self._T(width=self.width, height=self.height)
-        except TypeError:
-            self.game = self._T()
-        return self.game
-
-    # --------- Capability checks & adapters ---------
-    def has_enumeration(self) -> bool:
-        return hasattr(self.game, "get_possible_states")
-
-    def has_apply(self) -> bool:
-        return hasattr(self.game, "apply_action")
-
-    def enumerate_actions(self) -> Dict[int, Dict[str, Any]]:
-        """
-        Return a map: local_action_index -> { 'board': np.ndarray, 'lines': int, ... }
-        If the engine provides get_possible_states(), we adapt its return.
-        Otherwise, we return a single "no-op" action to keep training flow alive.
-        """
-        if self.has_enumeration():
-            states = self.game.get_possible_states()  # type: ignore[attr-defined]
-            out: Dict[int, Dict[str, Any]] = {}
-            # states may be {engine_action_id -> (board, lines, ...)} or dicts
-            for i, (k, v) in enumerate(states.items()):
-                if isinstance(v, dict):
-                    board = v.get("board")
-                    lines = int(v.get("lines", 0))
-                    meta = v
-                else:
-                    # assume tuple-like
-                    board = v[0]
-                    lines = int(v[1]) if len(v) > 1 else 0
-                    meta = {"raw": v}
-                out[i] = {"board": board, "lines": lines, "meta": meta, "engine_key": k}
-            return out
-
-        # Fallback: single action that effectively terminates when applied
-        return {0: {"board": self.game.board.copy(), "lines": 0, "meta": {}, "engine_key": 0}}
-
-    def apply_action(self, local_index: int, last_actions: Dict[int, Dict[str, Any]]) -> Tuple[float, bool, Dict[str, Any]]:
-        """
-        Apply the chosen action. If the engine supports apply_action, forward it.
-        We pass the *local* index by default; if your engine requires its own
-        action key, you can map via last_actions[local_index]['engine_key'].
-        """
-        if self.has_apply():
-            # Prefer passing the engine's real key if available
-            engine_key = last_actions.get(local_index, {}).get("engine_key", local_index)
-            return self.game.apply_action(int(engine_key))  # type: ignore[attr-defined]
-
-        # Fallback: no apply path — end the episode with small penalty
-        setattr(self.game, "game_over", True)
-        return -1.0, True, {"reason": "apply_action not available in engine"}
-
-    def get_board(self) -> np.ndarray:
-        return np.asarray(self.game.board)
-
-    def score(self) -> int:
-        return int(getattr(self.game, "score", 0))
-
-    def game_over(self) -> bool:
-        return bool(getattr(self.game, "game_over", False))
-
-    def render_rgb(self) -> Optional[np.ndarray]:
-        if hasattr(self.game, "render"):
-            try:
-                return self.game.render(mode="rgb_array")  # type: ignore[attr-defined]
-            except TypeError:
-                # Some engines expose render() without mode
-                arr = self.game.render()  # type: ignore[attr-defined]
-                return np.asarray(arr) if arr is not None else None
+def _to_array(x):
+    try:
+        return np.array(x)
+    except Exception:
         return None
 
 
-# -----------------------------
-# Gymnasium Env
-# -----------------------------
+def _count_full_lines(board_2d: np.ndarray) -> int:
+    if board_2d is None or board_2d.ndim != 2:
+        return 0
+    return int(np.sum(np.all(board_2d != 0, axis=1)))
+
+
+def _count_holes(board_2d: np.ndarray) -> int:
+    if board_2d is None or board_2d.ndim != 2:
+        return 0
+    holes = 0
+    H, W = board_2d.shape
+    col_nonzero = (board_2d != 0)
+    for c in range(W):
+        seen = False
+        for r in range(H):
+            if col_nonzero[r, c]:
+                seen = True
+            elif seen:
+                holes += 1
+    return int(holes)
+
+
+def _obs_from(board_like) -> np.ndarray:
+    b = _to_array(board_like)
+    if b is None or b.ndim != 2:
+        return np.zeros((20, 10), dtype=np.float32)
+    return (b != 0).astype(np.float32)
+
+
 class TetrisEnv(gym.Env):
     """
-    Observation: (H, W) float32 grid of 0/1 occupancy.
-    Action: Discrete(N) enumerated placements (rotations × columns). N is capped.
+    Gymnasium wrapper for engines.nuno_faria.tetris.Tetris.
+
+    Observation: (H, W) float32 occupancy (0/1)
+    Action: Discrete(max_actions) -> engine key from get_next_states(),
+            padded so *all* indices are valid each step.
+    Reward (post-step):
+        reward = +1.0 * lines_delta + 0.05 * holes_delta - 0.001
+      where lines_delta = full_rows(after) - full_rows(before)
+            holes_delta = holes(before) - holes(after)
     """
     metadata = {"render_modes": ["human", "rgb_array"], "render_fps": 30}
 
-    def __init__(self, width: int = 10, height: int = 20, render_mode: Optional[str] = None, max_actions: int = 64):
+    def __init__(self, render_mode: Optional[str] = None, max_actions: int = 64):
         super().__init__()
         self.render_mode = render_mode
-        self.adapter = _EngineAdapter(width=width, height=height)
-
-        # Use adapter-reported dims to size the observation space
-        H = getattr(self.adapter, "height", height)
-        W = getattr(self.adapter, "width", width)
-        self.observation_space = spaces.Box(low=0.0, high=1.0, shape=(H, W), dtype=np.float32)
-
-        # Discrete action space (we cap to keep a fixed space for SB3)
         self.max_actions = int(max(1, max_actions))
+
+        self.game = T.Tetris()
+
+        H = len(self.game.board)
+        W = len(self.game.board[0])
+        self.observation_space = spaces.Box(low=0.0, high=1.0, shape=(H, W), dtype=np.float32)
         self.action_space = spaces.Discrete(self.max_actions)
 
-        # Cache of actions enumerated for the *current* piece
-        self._last_actions: Dict[int, Dict[str, Any]] = {}
+        # Per-step maps: local index -> engine key
+        self._action_map: Dict[int, Any] = {}
+        self._num_valid: int = 0  # how many real actions before padding
 
-    # --------- Helper methods ---------
-    def _enumerate_actions(self) -> Dict[int, Dict[str, Any]]:
-        mapping = self.adapter.enumerate_actions()
-        # Enforce a fixed upper bound
-        keys = list(mapping.keys())[: self.max_actions]
-        limited = {i: mapping[k] for i, k in enumerate(keys)}
-        self._last_actions = limited
-        return limited
-
+    # ---------- helpers ----------
     def _obs(self) -> np.ndarray:
-        board = (self.adapter.get_board() > 0).astype(np.float32)
-        return board
+        return _obs_from(self.game.board)
 
-    # --------- Gymnasium API ---------
+    def _enumerate_actions(self) -> int:
+        """
+        Build mapping for local indices [0..max_actions-1] to engine keys.
+        If engine provides fewer than max_actions, we pad by repeating the first valid key,
+        so any policy output index is always valid.
+        """
+        next_states = self.game.get_next_states()  # dict: engine_key -> state
+        engine_keys = list(next_states.keys())
+
+        k = min(len(engine_keys), self.max_actions)
+        if k == 0:
+            # No valid moves — keep previous map empty; caller should terminate
+            self._action_map = {}
+            self._num_valid = 0
+            return 0
+
+        # First fill with actual valid keys
+        mapping = {i: engine_keys[i] for i in range(k)}
+
+        # Pad up to max_actions by repeating a safe key (index 0)
+        if k < self.max_actions:
+            pad_key = engine_keys[0]
+            for i in range(k, self.max_actions):
+                mapping[i] = pad_key
+
+        self._action_map = mapping
+        self._num_valid = k
+        return k
+
+    def _normalize_engine_key(self, engine_key) -> Tuple[int, int]:
+        """Return (action, rotation) for engine.play(). Handles tuple/list/dict/str/int keys."""
+        try:
+            if isinstance(engine_key, (tuple, list)) and len(engine_key) >= 2:
+                return int(engine_key[0]), int(engine_key[1])
+            if isinstance(engine_key, dict):
+                act = int(engine_key.get("action", engine_key.get("x", next(iter(engine_key.values())))))
+                rot = int(engine_key.get("rotation", engine_key.get("rot", 0)))
+                return act, rot
+            if isinstance(engine_key, str):
+                s = engine_key.replace("x=", "").replace("action=", "").replace("rot=", "").replace("rotation=", "")
+                parts = s.replace(" ", "").split(",")
+                if len(parts) >= 2:
+                    return int(parts[0]), int(parts[1])
+                return int(parts[0]), 0
+            if isinstance(engine_key, (int, np.integer)):
+                return int(engine_key), 0
+        except Exception:
+            pass
+        return 0, 0
+
+    def _apply_with_autodetect(self, engine_key) -> None:
+        """
+        Try play(act, rot), then play(rot, act), then play(engine_key) single-arg.
+        Accept the first variant that changes the board or sets game_over.
+        """
+        before = _to_array(self.game.board)
+
+        # 1) play(act, rot)
+        a, r = self._normalize_engine_key(engine_key)
+        try:
+            self.game.play(a, r)
+            after = _to_array(self.game.board)
+            if bool(getattr(self.game, "game_over", False)) or (after is not None and before is not None and not np.array_equal(after, before)):
+                return
+        except Exception:
+            pass
+
+        # 2) play(rot, act)
+        try:
+            self.game.play(r, a)
+            after = _to_array(self.game.board)
+            if bool(getattr(self.game, "game_over", False)) or (after is not None and before is not None and not np.array_equal(after, before)):
+                return
+        except Exception:
+            pass
+
+        # 3) play(engine_key) single-arg
+        try:
+            self.game.play(engine_key)
+        except Exception:
+            # If all variants fail, it will be a no-op; reward will be the step penalty.
+            pass
+
+    # ---------- Gymnasium API ----------
     def reset(self, *, seed: Optional[int] = None, options: Optional[dict] = None):
         super().reset(seed=seed)
-        self.adapter.reset()
-        self._enumerate_actions()
-        obs = self._obs()
-        info = {"valid_actions": len(self._last_actions), "score": self.adapter.score()}
-        return obs, info
+        self.game.reset()
+        valid = self._enumerate_actions()
+        return self._obs(), {"valid_actions": valid}
 
     def step(self, action: int):
-        # Validate action index against current enumeration
-        if action not in self._last_actions:
-            # End episode to avoid undefined behavior
-            obs = self._obs()
-            return obs, -1.0, True, False, {"error": "invalid_action_index"}
+        # Accept numpy actions and modulo-map into the available range
+        try:
+            import numpy as _np
+            if isinstance(action, _np.ndarray):
+                action = int(action.squeeze())
+            else:
+                action = int(action)
+        except Exception:
+            action = int(action)
 
-        reward, terminated, info = self.adapter.apply_action(int(action), self._last_actions)
+        # If no valid actions, end episode
+        if self._num_valid == 0:
+            return self._obs(), -1.0, True, False, {"error": "no_valid_actions"}
 
-        # If still alive, enumerate actions for the next piece
-        if not terminated and not self.adapter.game_over():
-            self._enumerate_actions()
+        # Map action into [0, max_actions) then into [0, _num_valid) if you want only real keys
+        # We padded the map, so any index is valid; still modulo for safety:
+        action = action % self.action_space.n
+        engine_key = self._action_map.get(action)
+        if engine_key is None:
+            # ultra-guard: map into real valid range
+            engine_key = self._action_map[action % self._num_valid]
 
-        obs = self._obs()
-        done = bool(terminated or self.adapter.game_over())
-        info = {**(info or {}), "valid_actions": len(self._last_actions), "score": self.adapter.score()}
-        return obs, float(reward), done, False, info
+        # BEFORE metrics
+        before_board = _to_array(self.game.board)
+        lines_before = _count_full_lines(before_board)
+        holes_before = _count_holes(before_board)
+
+        # Apply
+        self._apply_with_autodetect(engine_key)
+
+        # AFTER metrics
+        after_board = _to_array(self.game.board)
+        lines_after = _count_full_lines(after_board)
+        holes_after = _count_holes(after_board)
+
+        lines_delta = max(0, lines_after - lines_before)
+        holes_delta = max(0, holes_before - holes_after)
+
+        # Reward: encourage line clears, reducing holes; tiny step penalty
+        reward = 1.0 * lines_delta + 0.05 * holes_delta - 0.001
+
+        terminated = bool(getattr(self.game, "game_over", False))
+        truncated = False
+
+        valid = 0
+        if not terminated:
+            valid = self._enumerate_actions()
+
+        info = {
+            "engine_key": engine_key,
+            "valid_actions": valid,
+            "lines_delta": lines_delta,
+            "holes_delta": holes_delta,
+        }
+        return self._obs(), float(reward), terminated, truncated, info
 
     def render(self):
-        if self.render_mode == "rgb_array":
-            return self.adapter.render_rgb()
-        # For "human" you could add a simple print or pygame viewer if desired.
+        if hasattr(self.game, "render") and callable(self.game.render):
+            try:
+                return self.game.render()
+            except Exception:
+                pass
 
     def close(self):
         pass
