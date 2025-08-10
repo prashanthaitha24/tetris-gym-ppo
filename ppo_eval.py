@@ -1,6 +1,7 @@
 from stable_baselines3 import PPO
 from gym_tetris import TetrisEnv
 import argparse, pathlib
+import numpy as np
 
 if __name__ == "__main__":
     p = argparse.ArgumentParser()
@@ -16,6 +17,11 @@ if __name__ == "__main__":
         done, total = False, 0.0
         while not done:
             action, _ = model.predict(obs, deterministic=True)
+            # >>> cast to scalar int <<<
+            if isinstance(action, np.ndarray):
+                action = int(action.squeeze())
+            else:
+                action = int(action)
             obs, r, terminated, truncated, info = env.step(action)
             done = terminated or truncated
             total += float(r)
