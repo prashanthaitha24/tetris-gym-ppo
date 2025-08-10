@@ -8,3 +8,6 @@ pip install -r requirements.txt
 python3.13 prepare_engine.py
 python3.13 ppo_train.py --timesteps 200000
 python3.13 ppo_eval.py --model runs/ppo_tetris.zip --episodes 5
+
+## Status
+Bootstrap initialized.
