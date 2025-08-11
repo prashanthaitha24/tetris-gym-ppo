@@ -8,4 +8,8 @@ dist/
 
 # Engine (vendor) code
 engines/nuno_faria/
+__pycache__/
+.DS_Store
+__MACOSX/
+._*
 *.zip
