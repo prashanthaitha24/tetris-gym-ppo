@@ -20,7 +20,6 @@ def _count_full_lines(board_2d: np.ndarray) -> int:
 
 
 def _count_holes(board_2d: np.ndarray) -> int:
-    """Holes = empty cells with at least one filled cell above it in the same column."""
     if board_2d is None or board_2d.ndim != 2:
         return 0
     holes = 0
@@ -39,7 +38,6 @@ def _count_holes(board_2d: np.ndarray) -> int:
 def _obs_from(board_like) -> np.ndarray:
     b = _to_array(board_like)
     if b is None or b.ndim != 2:
-        # Fallback to standard 20x10 if engine is unavailable for any reason
         return np.zeros((20, 10), dtype=np.float32)
     return (b != 0).astype(np.float32)
 
@@ -48,126 +46,67 @@ class TetrisEnv(gym.Env):
     """
     Gymnasium wrapper for engines.nuno_faria.tetris.Tetris.
 
-    Observation: (H, W) float32 occupancy (0/1).
-    Action: Discrete(max_actions) -> engine key from get_next_states(),
-            padded so *every* index is valid each step.
+    Observation: (H, W) float32 occupancy (0/1)
+    Action: Discrete(max_actions) -> engine key (tuple: (x, rotation)) from get_next_states(),
+            padded so any index is valid.
     Reward (post-step board metrics):
-        reward = +1.0 * lines_delta + 0.05 * holes_delta - 0.001
-        where:
-          lines_delta = full_rows(after) - full_rows(before)
-          holes_delta = holes(before) - holes(after)
+        reward = +1.0*lines_delta + 0.05*holes_delta - 0.001
     """
-
     metadata = {"render_modes": ["human", "rgb_array"], "render_fps": 30}
 
     def __init__(self, render_mode: Optional[str] = None, max_actions: int = 64):
         super().__init__()
         self.render_mode = render_mode
         self.max_actions = int(max(1, max_actions))
-
-        # Engine
         self.game = T.Tetris()
 
-        # Observation space from engine board dims
         H = len(self.game.board)
         W = len(self.game.board[0])
         self.observation_space = spaces.Box(low=0.0, high=1.0, shape=(H, W), dtype=np.float32)
-
-        # Fixed Discrete action space (we remap per step)
         self.action_space = spaces.Discrete(self.max_actions)
 
-        # Per-step maps: local index -> engine key
         self._action_map: Dict[int, Any] = {}
-        self._num_valid: int = 0  # how many real actions before padding
+        self._num_valid: int = 0  # real actions before padding
 
     # ---------- helpers ----------
     def _obs(self) -> np.ndarray:
         return _obs_from(self.game.board)
 
     def _enumerate_actions(self) -> int:
-        """
-        Build mapping for local indices [0..max_actions-1] to engine keys.
-        If engine provides fewer than max_actions, pad by repeating a safe key so
-        any policy output index is valid.
-        """
-        next_states = self.game.get_next_states()  # dict: engine_key -> state
-        engine_keys = list(next_states.keys())
-
-        k = min(len(engine_keys), self.max_actions)
+        ns = self.game.get_next_states()  # dict: engine_key -> state
+        keys = list(ns.keys())
+        k = min(len(keys), self.max_actions)
         if k == 0:
             self._action_map = {}
             self._num_valid = 0
             return 0
-
-        mapping = {i: engine_keys[i] for i in range(k)}
-
-        # Pad up to max_actions by repeating first valid key
+        mapping = {i: keys[i] for i in range(k)}
         if k < self.max_actions:
-            pad_key = engine_keys[0]
+            pad_key = keys[0]
             for i in range(k, self.max_actions):
                 mapping[i] = pad_key
-
         self._action_map = mapping
         self._num_valid = k
         return k
 
-    def _normalize_engine_key(self, engine_key) -> Tuple[int, int]:
-        """Return (action, rotation) for engine.play(). Handles tuple/list/dict/str/int keys."""
-        try:
-            if isinstance(engine_key, (tuple, list)) and len(engine_key) >= 2:
-                return int(engine_key[0]), int(engine_key[1])
-            if isinstance(engine_key, dict):
-                act = int(engine_key.get("action", engine_key.get("x", next(iter(engine_key.values())))))
-                rot = int(engine_key.get("rotation", engine_key.get("rot", 0)))
-                return act, rot
-            if isinstance(engine_key, str):
-                s = engine_key.replace("x=", "").replace("action=", "").replace("rot=", "").replace("rotation=", "")
-                parts = s.replace(" ", "").split(",")
-                if len(parts) >= 2:
-                    return int(parts[0]), int(parts[1])
-                return int(parts[0]), 0
-            if isinstance(engine_key, (int, np.integer)):
-                return int(engine_key), 0
-        except Exception:
-            pass
+    @staticmethod
+    def _to_x_rot(engine_key) -> Tuple[int, int]:
+        # Expect tuples from get_next_states(); keep robust fallbacks
+        if isinstance(engine_key, (tuple, list)) and len(engine_key) >= 2:
+            return int(engine_key[0]), int(engine_key[1])
+        if isinstance(engine_key, dict):
+            x = int(engine_key.get("x", engine_key.get("action", next(iter(engine_key.values())))))
+            rot = int(engine_key.get("rotation", engine_key.get("rot", 0)))
+            return x, rot
+        if isinstance(engine_key, str):
+            s = engine_key.replace("x=", "").replace("action=", "").replace("rot=", "").replace("rotation=", "")
+            parts = s.replace(" ", "").split(",")
+            if len(parts) >= 2:
+                return int(parts[0]), int(parts[1])
+            return int(parts[0]), 0
+        if isinstance(engine_key, (int, np.integer)):
+            return int(engine_key), 0
         return 0, 0
-
-    def _apply_with_autodetect(self, engine_key) -> None:
-        """
-        Try play(act, rot), then play(rot, act), then play(engine_key) single-arg.
-        Accept the first variant that changes the board or sets game_over.
-        """
-        before = _to_array(self.game.board)
-
-        # 1) play(act, rot)
-        a, r = self._normalize_engine_key(engine_key)
-        try:
-            self.game.play(a, r)
-            after = _to_array(self.game.board)
-            if bool(getattr(self.game, "game_over", False)) or (
-                after is not None and before is not None and not np.array_equal(after, before)
-            ):
-                return
-        except Exception:
-            pass
-
-        # 2) play(rot, act)
-        try:
-            self.game.play(r, a)
-            after = _to_array(self.game.board)
-            if bool(getattr(self.game, "game_over", False)) or (
-                after is not None and before is not None and not np.array_equal(after, before)
-            ):
-                return
-        except Exception:
-            pass
-
-        # 3) play(engine_key) single-arg
-        try:
-            self.game.play(engine_key)
-        except Exception:
-            # If all variants fail, that's okay; reward will be step penalty only
-            pass
 
     # ---------- Gymnasium API ----------
     def reset(self, *, seed: Optional[int] = None, options: Optional[dict] = None):
@@ -177,7 +116,7 @@ class TetrisEnv(gym.Env):
         return self._obs(), {"valid_actions": valid}
 
     def step(self, action: int):
-        # Accept numpy actions and modulo-map into bounds
+        # normalize action and map through padded table
         try:
             import numpy as _np
             if isinstance(action, _np.ndarray):
@@ -190,19 +129,17 @@ class TetrisEnv(gym.Env):
         if self._num_valid == 0:
             return self._obs(), -1.0, True, False, {"error": "no_valid_actions"}
 
-        # Map into [0, action_space.n) then into our padded map
         action = action % self.action_space.n
-        engine_key = self._action_map.get(action)
-        if engine_key is None:
-            engine_key = self._action_map[action % max(1, self._num_valid)]
+        engine_key = self._action_map.get(action, self._action_map[0])
+        x, rot = self._to_x_rot(engine_key)
 
         # BEFORE metrics
         before_board = _to_array(self.game.board)
         lines_before = _count_full_lines(before_board)
         holes_before = _count_holes(before_board)
 
-        # Apply move
-        self._apply_with_autodetect(engine_key)
+        # Apply move (hard-wired: play(x, rotation))
+        self.game.play(x, rot)
 
         # AFTER metrics
         after_board = _to_array(self.game.board)
@@ -211,8 +148,6 @@ class TetrisEnv(gym.Env):
 
         lines_delta = max(0, lines_after - lines_before)
         holes_delta = max(0, holes_before - holes_after)
-
-        # Reward shaping
         reward = 1.0 * lines_delta + 0.05 * holes_delta - 0.001
 
         terminated = bool(getattr(self.game, "game_over", False))
@@ -224,6 +159,8 @@ class TetrisEnv(gym.Env):
 
         info = {
             "engine_key": engine_key,
+            "x": x,
+            "rot": rot,
             "valid_actions": valid,
             "lines_delta": lines_delta,
             "holes_delta": holes_delta,
