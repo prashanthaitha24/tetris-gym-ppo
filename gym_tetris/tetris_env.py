@@ -3,6 +3,8 @@ import numpy as np
 import gymnasium as gym
 from gymnasium import spaces
 from typing import Optional, Dict, Any, Tuple
+
+# Correct engine import (no gym_tetris.engine module)
 from engines.nuno_faria import tetris as T
 
 
@@ -20,6 +22,7 @@ def _count_full_lines(board_2d: np.ndarray) -> int:
 
 
 def _count_holes(board_2d: np.ndarray) -> int:
+    """Holes = empty cells with at least one filled cell above in the same column."""
     if board_2d is None or board_2d.ndim != 2:
         return 0
     holes = 0
@@ -52,6 +55,7 @@ class TetrisEnv(gym.Env):
     Reward (post-step board metrics):
         reward = +1.0*lines_delta + 0.05*holes_delta - 0.001
     """
+
     metadata = {"render_modes": ["human", "rgb_array"], "render_fps": 30}
 
     def __init__(self, render_mode: Optional[str] = None, max_actions: int = 64):
@@ -60,38 +64,50 @@ class TetrisEnv(gym.Env):
         self.max_actions = int(max(1, max_actions))
         self.game = T.Tetris()
 
+        # Board size from engine
         H = len(self.game.board)
         W = len(self.game.board[0])
         self.observation_space = spaces.Box(low=0.0, high=1.0, shape=(H, W), dtype=np.float32)
         self.action_space = spaces.Discrete(self.max_actions)
 
+        # Local index -> engine key mapping (padded each step)
         self._action_map: Dict[int, Any] = {}
-        self._num_valid: int = 0  # real actions before padding
+        self._num_valid: int = 0  # number of real actions before padding
 
     # ---------- helpers ----------
     def _obs(self) -> np.ndarray:
         return _obs_from(self.game.board)
 
     def _enumerate_actions(self) -> int:
-        ns = self.game.get_next_states()  # dict: engine_key -> state
-        keys = list(ns.keys())
+        """
+        Map local indices [0..max_actions-1] to engine keys.
+        If engine provides fewer than max_actions, pad by repeating the first key.
+        """
+        next_states = self.game.get_next_states()  # dict: engine_key -> state
+        keys = list(next_states.keys())
         k = min(len(keys), self.max_actions)
+
         if k == 0:
             self._action_map = {}
             self._num_valid = 0
             return 0
+
         mapping = {i: keys[i] for i in range(k)}
         if k < self.max_actions:
             pad_key = keys[0]
             for i in range(k, self.max_actions):
                 mapping[i] = pad_key
+
         self._action_map = mapping
         self._num_valid = k
         return k
 
     @staticmethod
     def _to_x_rot(engine_key) -> Tuple[int, int]:
-        # Expect tuples from get_next_states(); keep robust fallbacks
+        """
+        Convert an engine key to (x, rotation).
+        Your probe showed keys are tuples like (x, rotation).
+        """
         if isinstance(engine_key, (tuple, list)) and len(engine_key) >= 2:
             return int(engine_key[0]), int(engine_key[1])
         if isinstance(engine_key, dict):
@@ -116,7 +132,7 @@ class TetrisEnv(gym.Env):
         return self._obs(), {"valid_actions": valid}
 
     def step(self, action: int):
-        # normalize action and map through padded table
+        # Normalize action, map through padded table
         try:
             import numpy as _np
             if isinstance(action, _np.ndarray):
@@ -127,6 +143,7 @@ class TetrisEnv(gym.Env):
             action = int(action)
 
         if self._num_valid == 0:
+            # No legal moves left → end episode
             return self._obs(), -1.0, True, False, {"error": "no_valid_actions"}
 
         action = action % self.action_space.n
@@ -138,7 +155,7 @@ class TetrisEnv(gym.Env):
         lines_before = _count_full_lines(before_board)
         holes_before = _count_holes(before_board)
 
-        # Apply move (hard-wired: play(x, rotation))
+        # Apply move using the engine's signature play(x, rotation)
         self.game.play(x, rot)
 
         # AFTER metrics
@@ -148,9 +165,9 @@ class TetrisEnv(gym.Env):
 
         lines_delta = max(0, lines_after - lines_before)
         holes_delta = max(0, holes_before - holes_after)
-        reward = 1.0 * lines_delta + 0.05 * holes_delta - 0.001
+        reward = 1.0 * lines_delta + 0.05 * holes_delta - 0.001  # small step penalty
 
-        terminated = bool(getattr(self.game, "game_over", False))
+        terminated = bool(getattr(self.game, "game_over", False) or getattr(self.game, "gameover", False))
         truncated = False
 
         valid = 0

@@ -2,6 +2,9 @@ from stable_baselines3 import PPO
 from stable_baselines3.common.vec_env import DummyVecEnv
 from gym_tetris import TetrisEnv
 import argparse, pathlib
+from callbacks.metrics import EpisodeMetrics
+cb = EpisodeMetrics()
+model.learn(total_timesteps=a.timesteps, callback=cb)
 
 def make_env():
     return TetrisEnv()
