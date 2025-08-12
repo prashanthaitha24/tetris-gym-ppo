@@ -1,12 +1,16 @@
 # gym_tetris/tetris_env.py
+from __future__ import annotations
+
+from typing import Optional, Dict, Any, Tuple, List
 import numpy as np
 import gymnasium as gym
 from gymnasium import spaces
-from typing import Optional, Dict, Any, Tuple
 
-# Correct engine import (no gym_tetris.engine module)
+# Local engine (NOT the pip 'gym-tetris')
 from engines.nuno_faria import tetris as T
 
+
+# -------------------- utilities --------------------
 
 def _to_array(x):
     try:
@@ -15,45 +19,44 @@ def _to_array(x):
         return None
 
 
-def _count_full_lines(board_2d: np.ndarray) -> int:
-    if board_2d is None or board_2d.ndim != 2:
-        return 0
-    return int(np.sum(np.all(board_2d != 0, axis=1)))
-
-
-def _count_holes(board_2d: np.ndarray) -> int:
-    """Holes = empty cells with at least one filled cell above in the same column."""
-    if board_2d is None or board_2d.ndim != 2:
-        return 0
-    holes = 0
-    H, W = board_2d.shape
-    nonzero = board_2d != 0
-    for c in range(W):
-        seen = False
-        for r in range(H):
-            if nonzero[r, c]:
-                seen = True
-            elif seen:
-                holes += 1
-    return int(holes)
-
-
 def _obs_from(board_like) -> np.ndarray:
+    """
+    Normalize board to 0/1 float32 occupancy (H, W).
+    Falls back to a 20x10 zero board if shape is unknown.
+    """
     b = _to_array(board_like)
     if b is None or b.ndim != 2:
         return np.zeros((20, 10), dtype=np.float32)
     return (b != 0).astype(np.float32)
 
 
+# -------------------- environment --------------------
+
 class TetrisEnv(gym.Env):
     """
     Gymnasium wrapper for engines.nuno_faria.tetris.Tetris.
 
-    Observation: (H, W) float32 occupancy (0/1)
-    Action: Discrete(max_actions) -> engine key (tuple: (x, rotation)) from get_next_states(),
-            padded so any index is valid.
-    Reward (post-step board metrics):
-        reward = +1.0*lines_delta + 0.05*holes_delta - 0.001
+    Observation:
+        Box(low=0.0, high=1.0, shape=(H, W), dtype=float32) -> binary 0/1 board occupancy
+
+    Action:
+        Discrete(max_actions).
+        At each step we enumerate available placements from engine.get_next_states(),
+        map them to local indices [0..max_actions-1], and pad by repeating the first key
+        so any index in Discrete(max_actions) is valid.
+
+    Reward (simple & robust):
+        - Positive proportional to engine score increase this step (score_delta)
+        - Tiny survival bonus per step (+0.002)
+        (You can later reintroduce holes/height shaping once clears are consistent.)
+
+    Info:
+        - "valid_actions": List[int] of currently valid local action indices
+        - "action_mask": np.ndarray[bool] (True = valid) for sb3-contrib ActionMasker
+        - "engine_key", "x", "rot": debug fields for chosen move
+        - "score": current engine score
+        - "score_delta": score increase this step (>=0)
+        - "lines_delta": 1 iff score increased this step (conservative flag)
     """
 
     metadata = {"render_modes": ["human", "rgb_array"], "render_fps": 30}
@@ -64,24 +67,41 @@ class TetrisEnv(gym.Env):
         self.max_actions = int(max(1, max_actions))
         self.game = T.Tetris()
 
-        # Board size from engine
+        # Infer board size from engine (expected 20x10)
         H = len(self.game.board)
         W = len(self.game.board[0])
         self.observation_space = spaces.Box(low=0.0, high=1.0, shape=(H, W), dtype=np.float32)
         self.action_space = spaces.Discrete(self.max_actions)
 
-        # Local index -> engine key mapping (padded each step)
+        # Action mapping/bookkeeping
         self._action_map: Dict[int, Any] = {}
-        self._num_valid: int = 0  # number of real actions before padding
+        self._num_valid: int = 0
+        self._valid_indices: List[int] = []
+        self._action_mask: np.ndarray = np.ones(self.max_actions, dtype=bool)
+
+        # Score tracking (engine provides get_game_score() or .score)
+        self._last_score: int = 0
 
     # ---------- helpers ----------
+
     def _obs(self) -> np.ndarray:
         return _obs_from(self.game.board)
 
+    def _read_score(self) -> int:
+        """Read engine score via method if available, else attribute."""
+        if hasattr(self.game, "get_game_score") and callable(self.game.get_game_score):
+            v = self.game.get_game_score()
+        else:
+            v = getattr(self.game, "score", 0)
+        try:
+            return int(v or 0)
+        except Exception:
+            return 0
+
     def _enumerate_actions(self) -> int:
         """
-        Map local indices [0..max_actions-1] to engine keys.
-        If engine provides fewer than max_actions, pad by repeating the first key.
+        Build local index -> engine key mapping from get_next_states().
+        Also computes the action mask and list of valid indices.
         """
         next_states = self.game.get_next_states()  # dict: engine_key -> state
         keys = list(next_states.keys())
@@ -90,6 +110,8 @@ class TetrisEnv(gym.Env):
         if k == 0:
             self._action_map = {}
             self._num_valid = 0
+            self._valid_indices = []
+            self._action_mask = np.zeros(self.max_actions, dtype=bool)
             return 0
 
         mapping = {i: keys[i] for i in range(k)}
@@ -100,18 +122,22 @@ class TetrisEnv(gym.Env):
 
         self._action_map = mapping
         self._num_valid = k
+        self._valid_indices = list(range(k))
+
+        mask = np.zeros(self.max_actions, dtype=bool)
+        mask[:k] = True
+        self._action_mask = mask
         return k
 
     @staticmethod
     def _to_x_rot(engine_key) -> Tuple[int, int]:
         """
-        Convert an engine key to (x, rotation).
-        Your probe showed keys are tuples like (x, rotation).
+        Convert an engine key to (x, rotation). Supports common shapes.
         """
         if isinstance(engine_key, (tuple, list)) and len(engine_key) >= 2:
             return int(engine_key[0]), int(engine_key[1])
         if isinstance(engine_key, dict):
-            x = int(engine_key.get("x", engine_key.get("action", next(iter(engine_key.values())))))
+            x = int(engine_key.get("x", engine_key.get("action", 0)))
             rot = int(engine_key.get("rotation", engine_key.get("rot", 0)))
             return x, rot
         if isinstance(engine_key, str):
@@ -124,15 +150,28 @@ class TetrisEnv(gym.Env):
             return int(engine_key), 0
         return 0, 0
 
+    # ---------- mask API for sb3-contrib ----------
+
+    def valid_action_mask(self) -> np.ndarray:
+        """Boolean mask (True = valid) consumed by sb3-contrib ActionMasker."""
+        if isinstance(self._action_mask, np.ndarray):
+            return self._action_mask.copy()
+        return np.ones(self.max_actions, dtype=bool)
+
     # ---------- Gymnasium API ----------
+
     def reset(self, *, seed: Optional[int] = None, options: Optional[dict] = None):
         super().reset(seed=seed)
         self.game.reset()
-        valid = self._enumerate_actions()
-        return self._obs(), {"valid_actions": valid}
+        self._last_score = self._read_score()
+        self._enumerate_actions()
+        return self._obs(), {
+            "valid_actions": self._valid_indices,   # list[int]
+            "action_mask": self._action_mask,       # np.bool_
+        }
 
     def step(self, action: int):
-        # Normalize action, map through padded table
+        # Normalize action to int within [0, max_actions)
         try:
             import numpy as _np
             if isinstance(action, _np.ndarray):
@@ -144,43 +183,54 @@ class TetrisEnv(gym.Env):
 
         if self._num_valid == 0:
             # No legal moves left → end episode
-            return self._obs(), -1.0, True, False, {"error": "no_valid_actions"}
+            return self._obs(), 0.0, True, False, {
+                "error": "no_valid_actions",
+                "valid_actions": [],
+                "action_mask": np.zeros(self.max_actions, dtype=bool),
+                "score": int(self._last_score),
+                "score_delta": 0,
+                "lines_delta": 0,
+            }
 
         action = action % self.action_space.n
-        engine_key = self._action_map.get(action, self._action_map[0])
+        engine_key = self._action_map.get(action, self._action_map.get(0, (0, 0)))
         x, rot = self._to_x_rot(engine_key)
 
-        # BEFORE metrics
-        before_board = _to_array(self.game.board)
-        lines_before = _count_full_lines(before_board)
-        holes_before = _count_holes(before_board)
-
-        # Apply move using the engine's signature play(x, rotation)
+        # Apply move via engine
         self.game.play(x, rot)
 
-        # AFTER metrics
-        after_board = _to_array(self.game.board)
-        lines_after = _count_full_lines(after_board)
-        holes_after = _count_holes(after_board)
+        # Score delta -> positive signal when clears/points awarded
+        score_now = self._read_score()
+        score_delta = max(0, score_now - self._last_score)
+        self._last_score = score_now
 
-        lines_delta = max(0, lines_after - lines_before)
-        holes_delta = max(0, holes_before - holes_after)
-        reward = 1.0 * lines_delta + 0.05 * holes_delta - 0.001  # small step penalty
+        # Conservative "line event" flag: 1 whenever score increased
+        lines_delta = 1 if score_delta > 0 else 0
 
+        # Reward: proportional to score gain (clipped) + tiny survival bonus
+        reward = 0.1 * float(min(score_delta, 10))  # scale + clip spikes
+        reward += 0.002
+
+        # Termination flag from engine (support both attributes)
         terminated = bool(getattr(self.game, "game_over", False) or getattr(self.game, "gameover", False))
         truncated = False
 
-        valid = 0
+        # Refresh valid actions if not terminal
         if not terminated:
-            valid = self._enumerate_actions()
+            self._enumerate_actions()
+        else:
+            self._valid_indices = []
+            self._action_mask = np.zeros(self.max_actions, dtype=bool)
 
         info = {
             "engine_key": engine_key,
             "x": x,
             "rot": rot,
-            "valid_actions": valid,
-            "lines_delta": lines_delta,
-            "holes_delta": holes_delta,
+            "valid_actions": self._valid_indices,   # list[int]
+            "action_mask": self._action_mask,       # np.bool_
+            "score": int(score_now),
+            "score_delta": int(score_delta),
+            "lines_delta": int(lines_delta),
         }
         return self._obs(), float(reward), terminated, truncated, info
 
