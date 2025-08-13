@@ -1,18 +1,14 @@
-# inspect_env.py
 from gym_tetris import TetrisEnv
 
 def pick_action(info, action_space):
     va = info.get("valid_actions", None)
     if va is None:
         return action_space.sample()
-    # If it's already a single valid action id (int-like)
     if isinstance(va, (int,)):
         return int(va)
-    # If it's a container of valid actions
     if isinstance(va, (list, tuple, set)):
         va_list = list(va)
         return va_list[0] if va_list else action_space.sample()
-    # Unknown type — be defensive
     return action_space.sample()
 
 env = TetrisEnv()

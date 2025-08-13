@@ -1,4 +1,3 @@
-# ppo_eval.py
 from __future__ import annotations
 
 import argparse
@@ -15,7 +14,7 @@ from gym_tetris import TetrisEnv
 
 
 def mask_fn(env) -> np.ndarray:
-    # Unwrap to find env.valid_action_mask()
+    # find env.valid_action_mask()
     base = env
     hops = 0
     while not hasattr(base, "valid_action_mask") and hasattr(base, "env") and hops < 10:
@@ -42,7 +41,7 @@ def run_episode_vec(vec_env, model, deterministic: bool = False):
     Run exactly ONE episode on a 1-env DummyVecEnv.
     Returns dict with steps, reward, lines, topout.
     """
-    # VecEnv reset -> obs only
+    # VecEnv reset
     obs = vec_env.reset()
     steps = 0
     total_r = 0.0
@@ -60,8 +59,7 @@ def run_episode_vec(vec_env, model, deterministic: bool = False):
         lines += int(infos[0].get("lines_delta", 0) or 0)
 
         if done[0]:
-            # For Gymnasium-style envs, 'done' covers terminated|truncated combined in VecEnv
-            # We stored topout (terminated) in info at step() time if you choose to add it;
+            # We stored topout (terminated) in info at step() time if we choose to add it;
             # otherwise treat any 'done' as episode end.
             topout = bool(infos[0].get("terminal_observation") is not None or infos[0].get("final_observation") is not None)
             break
@@ -81,12 +79,12 @@ if __name__ == "__main__":
     # Build single env for evaluation
     env = DummyVecEnv([make_env(args.max_steps)])
 
-    # If you trained with --normalize, load stats so obs/reward scaling matches training
+    # If we train with --normalize, load stats so obs/reward scaling matches training
     vn_path = Path(args.save_dir) / "vecnormalize.pkl"
     if vn_path.exists():
         env = VecNormalize.load(str(vn_path), env)
         env.training = False
-        env.norm_reward = False  # don't normalize rewards at eval time
+        env.norm_reward = False  # No normalize rewards at eval time
 
     # Load model (MaskablePPO)
     model = MaskablePPO.load(args.model)

@@ -1,4 +1,3 @@
-# ppo_train.py
 from __future__ import annotations
 
 import argparse, os
@@ -11,7 +10,7 @@ from sb3_contrib.common.wrappers import ActionMasker
 from stable_baselines3.common.env_util import make_vec_env
 from stable_baselines3.common.vec_env import DummyVecEnv, SubprocVecEnv, VecNormalize
 
-from gym_tetris import TetrisEnv  # your local env
+from gym_tetris import TetrisEnv  # from local
 
 
 def parse_args():
@@ -39,7 +38,7 @@ def mask_fn(env) -> np.ndarray:
         base = base.env
         visited += 1
     if not hasattr(base, "valid_action_mask"):
-        # Fallback: allow all actions if something is off
+        # Allow all actions if something is off
         return np.ones(env.action_space.n, dtype=bool)
     return base.valid_action_mask()
 
@@ -47,8 +46,8 @@ def mask_fn(env) -> np.ndarray:
 def make_single_env(max_steps: int):
     def _thunk():
         e = TetrisEnv()
-        # IMPORTANT: ActionMasker should wrap the BASE env (inner),
-        # and TimeLimit should be OUTSIDE (outer) so mask_fn sees TetrisEnv.
+        # IMPORTANT: ActionMasker wraps the BASE env (inner),
+        # and TimeLimit is OUTSIDE (outer) so mask_fn sees TetrisEnv.
         e = ActionMasker(e, mask_fn)
         if max_steps:
             e = TimeLimit(e, max_episode_steps=max_steps)
