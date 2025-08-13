@@ -6,7 +6,7 @@ import numpy as np
 import gymnasium as gym
 from gymnasium import spaces
 
-# Local engine (NOT the pip 'gym-tetris')
+# Local engine (It's NOT the pip 'gym-tetris')
 from engines.nuno_faria import tetris as T
 
 
@@ -48,7 +48,6 @@ class TetrisEnv(gym.Env):
     Reward (simple & robust):
         - Positive proportional to engine score increase this step (score_delta)
         - Tiny survival bonus per step (+0.002)
-        (You can later reintroduce holes/height shaping once clears are consistent.)
 
     Info:
         - "valid_actions": List[int] of currently valid local action indices
@@ -67,7 +66,7 @@ class TetrisEnv(gym.Env):
         self.max_actions = int(max(1, max_actions))
         self.game = T.Tetris()
 
-        # Infer board size from engine (expected 20x10)
+        # Board size from engine (expected 20x10)
         H = len(self.game.board)
         W = len(self.game.board[0])
         self.observation_space = spaces.Box(low=0.0, high=1.0, shape=(H, W), dtype=np.float32)
@@ -82,7 +81,7 @@ class TetrisEnv(gym.Env):
         # Score tracking (engine provides get_game_score() or .score)
         self._last_score: int = 0
 
-    # ---------- helpers ----------
+    # ---------- helper functions ----------
 
     def _obs(self) -> np.ndarray:
         return _obs_from(self.game.board)
@@ -103,7 +102,7 @@ class TetrisEnv(gym.Env):
         Build local index -> engine key mapping from get_next_states().
         Also computes the action mask and list of valid indices.
         """
-        next_states = self.game.get_next_states()  # dict: engine_key -> state
+        next_states = self.game.get_next_states()
         keys = list(next_states.keys())
         k = min(len(keys), self.max_actions)
 
@@ -171,7 +170,6 @@ class TetrisEnv(gym.Env):
         }
 
     def step(self, action: int):
-        # Normalize action to int within [0, max_actions)
         try:
             import numpy as _np
             if isinstance(action, _np.ndarray):
@@ -182,7 +180,7 @@ class TetrisEnv(gym.Env):
             action = int(action)
 
         if self._num_valid == 0:
-            # No legal moves left → end episode
+            # End episode if no legal moves to left
             return self._obs(), 0.0, True, False, {
                 "error": "no_valid_actions",
                 "valid_actions": [],
@@ -208,14 +206,14 @@ class TetrisEnv(gym.Env):
         lines_delta = 1 if score_delta > 0 else 0
 
         # Reward: proportional to score gain (clipped) + tiny survival bonus
-        reward = 0.1 * float(min(score_delta, 10))  # scale + clip spikes
+        reward = 0.1 * float(min(score_delta, 10))
         reward += 0.002
 
-        # Termination flag from engine (support both attributes)
+        # Termination flag from engine (supporting both attributes)
         terminated = bool(getattr(self.game, "game_over", False) or getattr(self.game, "gameover", False))
         truncated = False
 
-        # Refresh valid actions if not terminal
+        # Refresh valid actions if not terminated
         if not terminated:
             self._enumerate_actions()
         else:
@@ -226,8 +224,8 @@ class TetrisEnv(gym.Env):
             "engine_key": engine_key,
             "x": x,
             "rot": rot,
-            "valid_actions": self._valid_indices,   # list[int]
-            "action_mask": self._action_mask,       # np.bool_
+            "valid_actions": self._valid_indices,
+            "action_mask": self._action_mask,
             "score": int(score_now),
             "score_delta": int(score_delta),
             "lines_delta": int(lines_delta),

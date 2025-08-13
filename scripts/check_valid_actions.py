@@ -1,4 +1,3 @@
-# scripts/check_valid_actions.py
 from gym_tetris import TetrisEnv
 from collections import Counter
 

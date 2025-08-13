@@ -1,4 +1,3 @@
-# sanity_check.py
 from gym_tetris import TetrisEnv
 import numpy as np
 import statistics as stats
@@ -17,7 +16,7 @@ def run_episode(env, seed=None):
     last_info = info
 
     while True:
-        # Use only valid actions if provided
+        # Only valid actions
         if isinstance(last_info.get("valid_actions"), (list, tuple)) and last_info["valid_actions"]:
             action = np.random.choice(last_info["valid_actions"])
         else:

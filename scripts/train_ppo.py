@@ -1,4 +1,3 @@
-# scripts/train_ppo.py
 from __future__ import annotations
 
 import argparse
@@ -52,7 +51,6 @@ def mask_fn(env) -> np.ndarray:
 def make_single_env(max_steps: int) -> Callable[[], TetrisEnv]:
     def _thunk():
         e = TetrisEnv()
-        # Mask inner, then cap episode length outside
         e = ActionMasker(e, mask_fn)
         if max_steps:
             e = TimeLimit(e, max_episode_steps=max_steps)
@@ -69,7 +67,6 @@ def build_train_env(args: argparse.Namespace):
 
 
 def build_eval_env(args: argparse.Namespace):
-    # single-env eval with identical wrappers
     eval_env = DummyVecEnv([make_single_env(args.max_steps)])
     if args.normalize:
         eval_env = VecNormalize(eval_env, norm_obs=True, norm_reward=True, clip_obs=10.0)
@@ -103,21 +100,21 @@ def main():
         tensorboard_log=args.tb_logdir,
     )
 
-    # If using VecNormalize, copy running stats to eval env (NO .load() here)
+    # If using VecNormalize, we copy running stats to eval env (NO .load() here)
     if args.normalize and isinstance(env, VecNormalize) and isinstance(eval_env, VecNormalize):
         eval_env.obs_rms = env.obs_rms
         eval_env.ret_rms = env.ret_rms
         eval_env.training = False
         eval_env.norm_reward = False
 
-    # Eval callback (saves best model)
+    # Eval callback saves best model
     best_dir = outdir / "best"
     best_dir.mkdir(parents=True, exist_ok=True)
     eval_cb = EvalCallback(
         eval_env,
         best_model_save_path=str(best_dir),
         log_path=str(outdir / "eval"),
-        eval_freq=max(1, 10_000 // max(1, args.n_envs)),  # ~every 10k steps
+        eval_freq=max(1, 10_000 // max(1, args.n_envs)),  # every 10k steps
         deterministic=True,
         render=False,
     )

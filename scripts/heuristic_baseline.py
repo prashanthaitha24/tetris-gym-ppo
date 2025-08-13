@@ -6,7 +6,7 @@ def choose_action(info, action_space):
     va = info.get("valid_actions")
     if isinstance(va, (list, tuple)) and va:
         # naive: prefer “do nothing / soft drop” if present, else random valid
-        # tweak this mapping to your env’s action ids
+        # tweak this mapping to the env’s action ids
         priority = [0, 1, 2, 3, 4]  # example placeholders
         for p in priority:
             if p in va: return p
