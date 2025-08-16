@@ -22,14 +22,14 @@ def mask_fn(env) -> np.ndarray:
         hops += 1
     if hasattr(base, "valid_action_mask"):
         return base.valid_action_mask()
-    # Fallback: allow all actions
+    # Allow all actions
     return np.ones(env.action_space.n, dtype=bool)
 
 
 def make_env(max_steps: int):
     def _thunk():
         e = TetrisEnv()
-        e = ActionMasker(e, mask_fn)             # ensure masks available
+        e = ActionMasker(e, mask_fn)
         if max_steps:
             e = TimeLimit(e, max_episode_steps=max_steps)
         return e
@@ -49,18 +49,16 @@ def run_episode_vec(vec_env, model, deterministic: bool = False):
     topout = False
 
     while True:
-        # model.predict expects batched obs from VecEnv
+        # Expects batched obs from VecEnv
         action, _ = model.predict(obs, deterministic=deterministic)
         obs, reward, done, infos = vec_env.step(action)
 
         steps += 1
         total_r += float(reward[0])
-        # infos is a list; we have 1 env -> infos[0]
+        # we have 1 env -> infos[0]
         lines += int(infos[0].get("lines_delta", 0) or 0)
 
         if done[0]:
-            # We stored topout (terminated) in info at step() time if we choose to add it;
-            # otherwise treat any 'done' as episode end.
             topout = bool(infos[0].get("terminal_observation") is not None or infos[0].get("final_observation") is not None)
             break
 
@@ -84,7 +82,7 @@ if __name__ == "__main__":
     if vn_path.exists():
         env = VecNormalize.load(str(vn_path), env)
         env.training = False
-        env.norm_reward = False  # No normalize rewards at eval time
+        env.norm_reward = False
 
     # Load model (MaskablePPO)
     model = MaskablePPO.load(args.model)

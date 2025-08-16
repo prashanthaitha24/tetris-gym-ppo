@@ -1,139 +1,89 @@
-from __future__ import annotations
-
-import argparse
+# scripts/train_ppo.py
 import os
-from pathlib import Path
-from typing import Callable
+import warnings
+warnings.filterwarnings("ignore", category=UserWarning)
+
 import numpy as np
-
-from gymnasium.wrappers import TimeLimit
-
-from sb3_contrib import MaskablePPO
-from sb3_contrib.common.wrappers import ActionMasker
-
-from stable_baselines3.common.env_util import make_vec_env
-from stable_baselines3.common.vec_env import DummyVecEnv, SubprocVecEnv, VecNormalize
-from stable_baselines3.common.callbacks import EvalCallback
-
+import gymnasium as gym
+from stable_baselines3 import PPO
+from stable_baselines3.common.vec_env import DummyVecEnv
 from gym_tetris import TetrisEnv
 
+def make_env():
+    return TetrisEnv()
 
-def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Train MaskablePPO on TetrisEnv")
-    p.add_argument("--timesteps", type=int, default=200_000)
-    p.add_argument("--seed", type=int, default=42)
-    p.add_argument("--max-steps", type=int, default=2000, help="Episode cap via TimeLimit")
-    p.add_argument("--n-envs", type=int, default=1, help="Parallel envs (try 4–8 for speed)")
-    p.add_argument("--normalize", action="store_true", help="Use VecNormalize (obs/reward)")
-    p.add_argument("--save-dir", type=str, default="runs", help="Where to save models/logs")
-    p.add_argument("--save-name", type=str, default="ppo_tetris.zip")
-    p.add_argument("--tb-logdir", type=str, default=None, help="TensorBoard log dir")
-    p.add_argument("--ent-coef", type=float, default=0.05, help="Entropy bonus (exploration)")
-    return p.parse_args()
+class RewardShapedTetris(gym.Wrapper):
+    def __init__(self, env):
+        super().__init__(env)
+        self.last_board = None
 
+    def reset(self, **kwargs):
+        obs, info = self.env.reset(**kwargs)
+        self.last_board = obs.copy()
+        return obs, info
 
-def mask_fn(env) -> np.ndarray:
-    """
-    Return boolean action mask; unwrap wrappers until we find base env.valid_action_mask().
-    ActionMasker calls this each step.
-    """
-    base = env
-    for _ in range(10):
-        if hasattr(base, "valid_action_mask"):
-            break
-        if hasattr(base, "env"):
-            base = base.env
-    if hasattr(base, "valid_action_mask"):
-        return base.valid_action_mask()
-    return np.ones(env.action_space.n, dtype=bool)  # fallback: allow all
+    def step(self, action):
+        obs, _, done, trunc, info = self.env.step(action)
 
+        lines_cleared = info.get("lines_delta", 0)
+        score_delta = info.get("score_delta", 0)
 
-def make_single_env(max_steps: int) -> Callable[[], TetrisEnv]:
-    def _thunk():
-        e = TetrisEnv()
-        e = ActionMasker(e, mask_fn)
-        if max_steps:
-            e = TimeLimit(e, max_episode_steps=max_steps)
-        return e
-    return _thunk
+        shaped = 0.0
+        shaped += lines_cleared * 2.0     # strong positive
+        shaped += score_delta * 1.0       # soft positive
+        shaped += 0.02                    # survival bonus
 
+        if self.last_board is not None:
+            holes_before = self._holes(self.last_board)
+            holes_after = self._holes(obs)
+            shaped -= max(0, holes_after - holes_before) * 0.5
 
-def build_train_env(args: argparse.Namespace):
-    vec_cls = SubprocVecEnv if args.n_envs > 1 else DummyVecEnv
-    env = make_vec_env(make_single_env(args.max_steps), n_envs=args.n_envs, seed=args.seed, vec_env_cls=vec_cls)
-    if args.normalize:
-        env = VecNormalize(env, norm_obs=True, norm_reward=True, clip_obs=10.0)
-    return env
+            h_before = self._max_height(self.last_board)
+            h_after = self._max_height(obs)
+            shaped -= max(0, h_after - h_before) * 0.05
 
+        self.last_board = obs.copy()
+        return obs, float(shaped), done, trunc, info
 
-def build_eval_env(args: argparse.Namespace):
-    eval_env = DummyVecEnv([make_single_env(args.max_steps)])
-    if args.normalize:
-        eval_env = VecNormalize(eval_env, norm_obs=True, norm_reward=True, clip_obs=10.0)
-        eval_env.training = False
-        eval_env.norm_reward = False
-    return eval_env
+    def _holes(self, board):
+        H, W = board.shape
+        filled = board != 0
+        holes = 0
+        for c in range(W):
+            seen = False
+            for r in range(H):
+                if filled[r, c]:
+                    seen = True
+                elif seen:
+                    holes += 1
+        return holes
 
-
-def main():
-    args = parse_args()
-    outdir = Path(args.save_dir)
-    outdir.mkdir(parents=True, exist_ok=True)
-
-    # Build envs
-    env = build_train_env(args)
-    eval_env = build_eval_env(args)
-
-    # Model (good exploration defaults)
-    model = MaskablePPO(
-        "MlpPolicy",
-        env,
-        seed=args.seed,
-        n_steps=2048,
-        batch_size=max(512, 256 * args.n_envs),
-        learning_rate=2.5e-4,
-        ent_coef=args.ent_coef,   # exploration
-        gamma=0.995,
-        gae_lambda=0.95,
-        clip_range=0.2,
-        verbose=1,
-        tensorboard_log=args.tb_logdir,
-    )
-
-    # If using VecNormalize, we copy running stats to eval env (NO .load() here)
-    if args.normalize and isinstance(env, VecNormalize) and isinstance(eval_env, VecNormalize):
-        eval_env.obs_rms = env.obs_rms
-        eval_env.ret_rms = env.ret_rms
-        eval_env.training = False
-        eval_env.norm_reward = False
-
-    # Eval callback saves best model
-    best_dir = outdir / "best"
-    best_dir.mkdir(parents=True, exist_ok=True)
-    eval_cb = EvalCallback(
-        eval_env,
-        best_model_save_path=str(best_dir),
-        log_path=str(outdir / "eval"),
-        eval_freq=max(1, 10_000 // max(1, args.n_envs)),  # every 10k steps
-        deterministic=True,
-        render=False,
-    )
-
-    # Train
-    model.learn(total_timesteps=args.timesteps, callback=eval_cb)
-
-    # Save final model + (optional) VecNormalize stats for offline eval
-    final_path = outdir / args.save_name
-    model.save(str(final_path))
-    if args.normalize and isinstance(env, VecNormalize):
-        env.save(str(outdir / "vecnormalize.pkl"))
-
-    print("Saved final model:", final_path)
-    print("Best model (EvalCallback):", best_dir / "best_model.zip")
-
-    env.close()
-    eval_env.close()
-
+    def _max_height(self, board):
+        H, W = board.shape
+        filled = board != 0
+        h = 0
+        for c in range(W):
+            col = filled[:, c]
+            h = max(h, H - np.argmax(col) if np.any(col) else 0)
+        return h
 
 if __name__ == "__main__":
-    main()
+    env = DummyVecEnv([lambda: RewardShapedTetris(make_env())])
+
+    model = PPO(
+        "MlpPolicy",
+        env,
+        n_steps=2048,
+        batch_size=256,
+        learning_rate=3e-4,
+        ent_coef=0.01,
+        clip_range=0.2,
+        verbose=1,
+        tensorboard_log="./ppo_tetris_tensorboard/"
+    )
+
+    timesteps = int(os.environ.get("TIMESTEPS", 200_000))
+    model.learn(total_timesteps=timesteps)
+    model.save("runs/ppo_tetris_shaped")
+
+    print("✅ Training complete. Model saved to runs/ppo_tetris_shaped.zip")
